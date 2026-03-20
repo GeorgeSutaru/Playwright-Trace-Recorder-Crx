@@ -15,7 +15,7 @@
     var btn = document.getElementById('pw-back-btn');
     if (btn) {
       btn.addEventListener('click', function () {
-        window.location.href = chrome.runtime.getURL('panel.html');
+        window.location.href = chrome.runtime.getURL('src/panel.html');
       });
     }
   });

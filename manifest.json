@@ -17,13 +17,13 @@
     "<all_urls>"
   ],
   "background": {
-    "service_worker": "service_worker.js",
+    "service_worker": "src/service_worker.js",
     "type": "module"
   },
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": ["src/content.js"],
       "run_at": "document_end",
       "all_frames": false
     }
@@ -32,9 +32,9 @@
     "default_title": "Playwright Trace Recorder"
   },
   "side_panel": {
-    "default_path": "panel.html"
+    "default_path": "src/panel.html"
   },
-  "devtools_page": "dev_panel.html",
+  "devtools_page": "src/dev_panel.html",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",

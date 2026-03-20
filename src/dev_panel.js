@@ -4,7 +4,7 @@
 chrome.devtools.panels.create(
   'Ventriloquist',
   '../icons/icon48.png',
-  'panel.html',
+  'src/panel.html',
   (panel) => {
     console.log('Ventriloquist panel registered');
   }

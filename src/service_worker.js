@@ -105,7 +105,7 @@ async function startRecording(name, tabId) {
         });
         await chrome.scripting.executeScript({
           target: { tabId },
-          files: ['content.js']
+          files: ['src/content.js']
         });
       } catch (e) {
         console.warn('Could not re-inject content script:', e.message);
