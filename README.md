@@ -2,7 +2,7 @@
 
 A Chrome extension that records browser interactions as Playwright traces. Saved locally, no backend needed.
 
-![Screen Recording](icons/screen-recording.gif)
+![Screen Recording](assets/screen-recording.gif)
 
 ## Features
 
