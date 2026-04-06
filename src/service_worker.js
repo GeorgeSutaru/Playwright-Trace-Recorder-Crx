@@ -10,6 +10,9 @@ let activeRecording = null;
 // ── Port registry ─────────────────────────────────────────────────────────────
 const panelPorts = new Set();
 
+// ── Network URL-to-requestId map (for fetching response bodies) ────────────────
+const networkUrlToRequestId = new Map();
+
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'ventriloquist-panel') return;
   panelPorts.add(port);
@@ -77,6 +80,17 @@ async function startRecording(name, tabId) {
         } catch (e) {
           console.warn(`Failed to enable ${domain} domain:`, e.message);
         }
+      }
+      // Reload the page so all network requests flow through CDP.
+      // This ensures Network.getResponseBody works for ALL resources,
+      // including cross-origin stylesheets that were loaded before recording.
+      try {
+        await chrome.debugger.sendCommand({ tabId }, 'Page.reload', { ignoreCache: false });
+        // Wait for resources to load
+        await new Promise(r => setTimeout(r, 2000));
+        console.log('Page reloaded to capture network resources');
+      } catch (e) {
+        console.warn('Could not reload page:', e.message);
       }
     }
   }
@@ -294,7 +308,142 @@ async function saveTraceLocally(trace) {
 }
 
 async function captureDomSnapshot(tabId) {
-  const EVAL_EXPR = `(function(){
+  // Phase 1: Read all stylesheets from page context
+  // - For same-origin/CORS-allowed: cssRules works, collect the text
+  // - For CORS-blocked: collect URLs to fetch via Network.getResponseBody
+  const fetchedStylesheets = {};
+  let blockedUrls = [];
+  
+  const READ_STYLESHEETS_EXPR = `(function(){
+    var result = { accessible: {}, blocked: [] };
+    for (var i = 0; i < document.styleSheets.length; i++) {
+      var ss = document.styleSheets[i];
+      var href = ss.href || (ss.ownerNode ? (ss.ownerNode.href || '') : '');
+      if (!href) continue;
+      try {
+        var rules = ss.cssRules;
+        var cssTexts = [];
+        for (var j = 0; j < rules.length; j++) {
+          cssTexts.push(rules[j].cssText);
+        }
+        result.accessible[href] = cssTexts.join('\\n');
+      } catch(e) {
+        result.blocked.push(href);
+      }
+    }
+    return JSON.stringify(result);
+  })()`;
+
+  try {
+    const ssResult = await chrome.debugger.sendCommand(
+      { tabId },
+      'Runtime.evaluate',
+      { expression: READ_STYLESHEETS_EXPR, returnByValue: true }
+    );
+    if (ssResult && ssResult.result && ssResult.result.value) {
+      const parsed = JSON.parse(ssResult.result.value);
+      Object.assign(fetchedStylesheets, parsed.accessible);
+      blockedUrls = parsed.blocked;
+    }
+  } catch (_) { /* ignore */ }
+
+  console.log(`[Snapshot] ${Object.keys(fetchedStylesheets).length} stylesheets accessible, ${blockedUrls.length} blocked`);
+
+  // Phase 2: Fetch blocked stylesheets
+  // Primary: Page.getResourceContent (works for all page-loaded resources via DevTools)
+  // Fallback: Network.getResponseBody (for requests captured during recording)
+  // Last fallback: XHR from page context
+  
+  // Get main frame ID for Page.getResourceContent
+  let mainFrameId = null;
+  try {
+    const treeResult = await chrome.debugger.sendCommand(
+      { tabId },
+      'Page.getResourceTree'
+    );
+    if (treeResult && treeResult.frameTree && treeResult.frameTree.frame) {
+      mainFrameId = treeResult.frameTree.frame.id;
+    }
+  } catch (_) { /* ignore */ }
+  
+  for (const url of blockedUrls) {
+    if (!url || fetchedStylesheets[url]) continue;
+    let fetched = false;
+    
+    // Try Page.getResourceContent with actual frame ID
+    if (mainFrameId) {
+      try {
+        const res = await chrome.debugger.sendCommand(
+          { tabId },
+          'Page.getResourceContent',
+          { frameId: mainFrameId, url }
+        );
+        if (res && res.content) {
+          fetchedStylesheets[url] = res.base64Encoded
+            ? atob(res.content)
+            : res.content;
+          fetched = true;
+          console.log(`[Snapshot] Fetched via Page.getResourceContent: ${url.substring(0, 80)}`);
+        }
+      } catch (_) { /* fall through */ }
+    }
+    
+    if (!fetched) {
+      // Try Network.getResponseBody (only works for requests during recording)
+      const reqId = networkUrlToRequestId.get(url);
+      if (reqId && activeRecording && activeRecording.debuggeeTabId) {
+        try {
+          const bodyRes = await chrome.debugger.sendCommand(
+            { tabId: activeRecording.debuggeeTabId },
+            'Network.getResponseBody',
+            { requestId: reqId }
+          );
+          if (bodyRes && bodyRes.body) {
+            fetchedStylesheets[url] = bodyRes.base64Encoded
+              ? atob(bodyRes.body)
+              : bodyRes.body;
+            fetched = true;
+            console.log(`[Snapshot] Fetched via Network.getResponseBody: ${url.substring(0, 80)}`);
+          }
+        } catch (_) { /* fall through */ }
+      }
+    }
+    
+    if (!fetched) {
+      // Last fallback: XHR from page context
+      try {
+        const FETCH_EXPR = `(function(){
+          return new Promise(function(resolve){
+            var x = new XMLHttpRequest();
+            x.onload = function(){ resolve(x.status >= 200 && x.status < 300 ? x.responseText : null); };
+            x.onerror = function(){ resolve(null); };
+            x.open('GET', ${JSON.stringify(url)});
+            x.send();
+          });
+        })()`;
+        const fetchResult = await chrome.debugger.sendCommand(
+          { tabId },
+          'Runtime.evaluate',
+          { expression: FETCH_EXPR, awaitPromise: true, returnByValue: true }
+        );
+        if (fetchResult && fetchResult.result && fetchResult.result.value) {
+          fetchedStylesheets[url] = fetchResult.result.value;
+          fetched = true;
+          console.log(`[Snapshot] Fetched via XHR: ${url.substring(0, 80)}`);
+        }
+      } catch (_) { /* give up */ }
+    }
+    
+    if (!fetched) {
+      console.warn(`[Snapshot] FAILED to fetch stylesheet: ${url.substring(0, 80)}`);
+    }
+  }
+
+  // Phase 3: Capture the full DOM snapshot, inlining known external stylesheets
+  // We pass the fetchedStylesheets as a JSON string into the evaluation context
+  const fetchedJSON = JSON.stringify(fetchedStylesheets);
+
+  const EVAL_EXPR = `(function(fetchedMap){
     try{
       function sheetText(sh){
         try{var rl=sh.cssRules,out=[];for(var i=0;i<rl.length;i++)out.push(rl[i].cssText);return out.join('\\n');}catch(e){return null;}
@@ -315,9 +464,19 @@ async function captureDomSnapshot(tabId) {
         }
         if(n.tagName==='LINK'){
           var rel=(n.getAttribute&&n.getAttribute('rel')||'').toLowerCase().trim();
-          if(rel==='stylesheet'&&n.sheet){
-            var css=sheetText(n.sheet);
-            if(css!==null)return ['STYLE',{'data-href':n.href||''},css];
+          if(rel==='stylesheet'){
+            var href=n.href||n.getAttribute('href')||'';
+            // First try same-origin access
+            if(n.sheet){
+              var css=sheetText(n.sheet);
+              if(css!==null)return ['STYLE',{'data-href':href},css];
+            }
+            // Then try fetched content
+            if(href && fetchedMap[href]){
+              return ['STYLE',{'data-href':href},fetchedMap[href]];
+            }
+            // Last resort: keep as LINK (won't render in trace viewer but preserves structure)
+            if(href)return ['LINK',{'rel':'stylesheet','href':href},null];
           }
         }
         var a={},i,ch=[];
@@ -348,7 +507,7 @@ async function captureDomSnapshot(tabId) {
         scrollY:window.scrollY
       });
     }catch(e){return null;}
-  })()`;
+  })(${fetchedJSON})`;
 
   try {
     const result = await chrome.debugger.sendCommand(
@@ -465,6 +624,15 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
     });
   } else if (method.startsWith('Network.')) {
     activeRecording.events.push({ type: 'cdp-network', method, params, timestamp });
+
+    // Track URL-to-requestId mapping for stylesheet fetching
+    if (method === 'Network.responseReceived' && params.response) {
+      const reqId = params.requestId;
+      const url = params.response.url;
+      if (reqId && url) {
+        networkUrlToRequestId.set(url, reqId);
+      }
+    }
 
     if (method === 'Network.loadingFinished' && activeRecording.debuggeeTabId) {
       try {
