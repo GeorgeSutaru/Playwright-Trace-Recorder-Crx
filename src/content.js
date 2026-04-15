@@ -16,6 +16,24 @@ let isReplaying = false;
 // Initialize content script
 console.log('Ventriloquist content script loaded');
 
+// ── Side Panel Open Handler ───────────────────────────────────────────────────
+// Listen for postMessage from the page (crosses JS isolation boundary).
+window.addEventListener('message', (event) => {
+  if (event.source !== window) return; // Only accept messages from the same page
+  if (!event.data || event.data.type !== 'playwrightTraceViewer:openSidePanel') return;
+
+  console.log('[Playwright Trace Recorder] Received playwrightTraceViewer:openSidePanel via postMessage — relaying to service worker');
+  chrome.runtime.sendMessage({ type: 'open_side_panel' })
+    .then(response => {
+      if (response && response.success) {
+        console.log('[Playwright Trace Recorder] ✅ Side panel opened via service worker');
+      } else {
+        console.warn('[Playwright Trace Recorder] ❌ Service worker could not open side panel:', response?.error);
+      }
+    })
+    .catch(err => console.warn('[Playwright Trace Recorder] ❌ Failed to relay to service worker:', err.message));
+});
+
 // Check initial recording status
 chrome.runtime.sendMessage({ type: 'GET_RECORDING_STATUS' }, (response) => {
   if (response && response.recording) {

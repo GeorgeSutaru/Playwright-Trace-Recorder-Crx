@@ -255,6 +255,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }).catch(() => sendResponse({ tabId: null }));
       return true;
 
+    case 'open_side_panel': {
+      // Content script relays here; Chrome populates sender.tab automatically.
+      const tabId = sender.tab?.id;
+      if (!tabId) {
+        console.warn('[Playwright Trace Recorder] No tab ID in sender for open_side_panel');
+        sendResponse({ success: false, error: 'No tab ID' });
+        return true;
+      }
+      (async () => {
+        try {
+          await chrome.sidePanel.open({ tabId });
+          console.log('[Playwright Trace Recorder] ✅ Side panel opened for tab:', tabId);
+          sendResponse({ success: true });
+        } catch (err) {
+          console.warn('[Playwright Trace Recorder] ❌ Failed to open side panel:', err.message);
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+    }
+
     default:
       sendResponse({ error: 'Unknown message type' });
   }
@@ -308,29 +329,29 @@ async function saveTraceLocally(trace) {
 }
 
 async function captureDomSnapshot(tabId) {
-  // Phase 1: Read all stylesheets from page context
-  // - For same-origin/CORS-allowed: cssRules works, collect the text
-  // - For CORS-blocked: collect URLs to fetch via Network.getResponseBody
-  const fetchedStylesheets = {};
-  let blockedUrls = [];
+  // Track external stylesheets for resource storage
+  const stylesheetResources = [];
   
   const READ_STYLESHEETS_EXPR = `(function(){
-    var result = { accessible: {}, blocked: [] };
+    var result = { stylesheets: [] };
+    
+    // Collect all stylesheet URLs from LINK elements (including preload stylesheets)
+    var cssUrls = new Set();
+    for (var link of document.querySelectorAll('link[rel*="stylesheet"], link[rel="preload"][as="style"]')) {
+      if (link.href) cssUrls.add(link.href);
+    }
+    
+    // Also add stylesheets from document.styleSheets (already loaded)
     for (var i = 0; i < document.styleSheets.length; i++) {
       var ss = document.styleSheets[i];
-      var href = ss.href || (ss.ownerNode ? (ss.ownerNode.href || '') : '');
-      if (!href) continue;
-      try {
-        var rules = ss.cssRules;
-        var cssTexts = [];
-        for (var j = 0; j < rules.length; j++) {
-          cssTexts.push(rules[j].cssText);
-        }
-        result.accessible[href] = cssTexts.join('\\n');
-      } catch(e) {
-        result.blocked.push(href);
-      }
+      if (ss.href) cssUrls.add(ss.href);
     }
+    
+    // Convert Set to array with accessible flag
+    for (var url of cssUrls) {
+      result.stylesheets.push({ href: url, accessible: false });
+    }
+    
     return JSON.stringify(result);
   })()`;
 
@@ -342,19 +363,13 @@ async function captureDomSnapshot(tabId) {
     );
     if (ssResult && ssResult.result && ssResult.result.value) {
       const parsed = JSON.parse(ssResult.result.value);
-      Object.assign(fetchedStylesheets, parsed.accessible);
-      blockedUrls = parsed.blocked;
+      stylesheetResources.push(...parsed.stylesheets);
     }
   } catch (_) { /* ignore */ }
 
-  console.log(`[Snapshot] ${Object.keys(fetchedStylesheets).length} stylesheets accessible, ${blockedUrls.length} blocked`);
+  console.log(`[Snapshot] Found ${stylesheetResources.length} stylesheets`);
 
-  // Phase 2: Fetch blocked stylesheets
-  // Primary: Page.getResourceContent (works for all page-loaded resources via DevTools)
-  // Fallback: Network.getResponseBody (for requests captured during recording)
-  // Last fallback: XHR from page context
-  
-  // Get main frame ID for Page.getResourceContent
+  // Phase 2: Fetch blocked stylesheets and store as resources
   let mainFrameId = null;
   try {
     const treeResult = await chrome.debugger.sendCommand(
@@ -366,9 +381,21 @@ async function captureDomSnapshot(tabId) {
     }
   } catch (_) { /* ignore */ }
   
-  for (const url of blockedUrls) {
-    if (!url || fetchedStylesheets[url]) continue;
-    let fetched = false;
+  for (const sheet of stylesheetResources) {
+    if (!sheet.href) continue;
+    
+    // Resolve relative URLs to absolute
+    let resolvedUrl = sheet.href;
+    try {
+      // Try to resolve as absolute URL first
+      if (!sheet.href.startsWith('http') && !sheet.href.startsWith('//')) {
+        // Relative URL - will be resolved by the fetch methods
+        console.log(`[Snapshot] Relative URL: ${sheet.href.substring(0, 80)}`);
+      }
+    } catch (e) {
+      console.warn(`[Snapshot] Could not parse URL: ${sheet.href}`);
+      continue;
+    }
     
     // Try Page.getResourceContent with actual frame ID
     if (mainFrameId) {
@@ -376,21 +403,22 @@ async function captureDomSnapshot(tabId) {
         const res = await chrome.debugger.sendCommand(
           { tabId },
           'Page.getResourceContent',
-          { frameId: mainFrameId, url }
+          { frameId: mainFrameId, url: resolvedUrl }
         );
         if (res && res.content) {
-          fetchedStylesheets[url] = res.base64Encoded
-            ? atob(res.content)
-            : res.content;
-          fetched = true;
-          console.log(`[Snapshot] Fetched via Page.getResourceContent: ${url.substring(0, 80)}`);
+          const cssContent = res.base64Encoded ? atob(res.content) : res.content;
+          // Store as resource for later use
+          sheet.cssContent = cssContent;
+          console.log(`[Snapshot] Fetched via Page.getResourceContent: ${resolvedUrl.substring(0, 80)}`);
         }
-      } catch (_) { /* fall through */ }
+      } catch (e) {
+        console.warn(`[Snapshot] Page.getResourceContent failed: ${resolvedUrl.substring(0, 80)} - ${e.message}`);
+      }
     }
     
-    if (!fetched) {
+    if (!sheet.cssContent) {
       // Try Network.getResponseBody (only works for requests during recording)
-      const reqId = networkUrlToRequestId.get(url);
+      const reqId = networkUrlToRequestId.get(resolvedUrl);
       if (reqId && activeRecording && activeRecording.debuggeeTabId) {
         try {
           const bodyRes = await chrome.debugger.sendCommand(
@@ -399,17 +427,16 @@ async function captureDomSnapshot(tabId) {
             { requestId: reqId }
           );
           if (bodyRes && bodyRes.body) {
-            fetchedStylesheets[url] = bodyRes.base64Encoded
-              ? atob(bodyRes.body)
-              : bodyRes.body;
-            fetched = true;
-            console.log(`[Snapshot] Fetched via Network.getResponseBody: ${url.substring(0, 80)}`);
+            sheet.cssContent = bodyRes.base64Encoded ? atob(bodyRes.body) : bodyRes.body;
+            console.log(`[Snapshot] Fetched via Network.getResponseBody: ${resolvedUrl.substring(0, 80)}`);
           }
-        } catch (_) { /* fall through */ }
+        } catch (e) {
+          console.warn(`[Snapshot] Network.getResponseBody failed: ${resolvedUrl.substring(0, 80)} - ${e.message}`);
+        }
       }
     }
     
-    if (!fetched) {
+    if (!sheet.cssContent) {
       // Last fallback: XHR from page context
       try {
         const FETCH_EXPR = `(function(){
@@ -417,7 +444,7 @@ async function captureDomSnapshot(tabId) {
             var x = new XMLHttpRequest();
             x.onload = function(){ resolve(x.status >= 200 && x.status < 300 ? x.responseText : null); };
             x.onerror = function(){ resolve(null); };
-            x.open('GET', ${JSON.stringify(url)});
+            x.open('GET', ${JSON.stringify(resolvedUrl)});
             x.send();
           });
         })()`;
@@ -427,77 +454,73 @@ async function captureDomSnapshot(tabId) {
           { expression: FETCH_EXPR, awaitPromise: true, returnByValue: true }
         );
         if (fetchResult && fetchResult.result && fetchResult.result.value) {
-          fetchedStylesheets[url] = fetchResult.result.value;
-          fetched = true;
-          console.log(`[Snapshot] Fetched via XHR: ${url.substring(0, 80)}`);
+          sheet.cssContent = fetchResult.result.value;
+          console.log(`[Snapshot] Fetched via XHR: ${resolvedUrl.substring(0, 80)}`);
         }
-      } catch (_) { /* give up */ }
+      } catch (e) {
+        console.warn(`[Snapshot] XHR failed: ${resolvedUrl.substring(0, 80)} - ${e.message}`);
+      }
     }
     
-    if (!fetched) {
-      console.warn(`[Snapshot] FAILED to fetch stylesheet: ${url.substring(0, 80)}`);
+    if (!sheet.cssContent) {
+      console.warn(`[Snapshot] FAILED to fetch stylesheet: ${resolvedUrl.substring(0, 80)}`);
     }
   }
 
-  // Phase 3: Capture the full DOM snapshot, inlining known external stylesheets
-  // We pass the fetchedStylesheets as a JSON string into the evaluation context
-  const fetchedJSON = JSON.stringify(fetchedStylesheets);
-
-  const EVAL_EXPR = `(function(fetchedMap){
+  // Phase 3: Capture the full DOM snapshot with relative resource paths
+  const EVAL_EXPR = `(function(){
     try{
-      function sheetText(sh){
-        try{var rl=sh.cssRules,out=[];for(var i=0;i<rl.length;i++)out.push(rl[i].cssText);return out.join('\\n');}catch(e){return null;}
-      }
       function s(n,d){
         if(!n||d>80)return null;
-        if(n.nodeType===3){
-          var t=n.textContent;
-          return t.length>5000?t.slice(0,5000)+'\u2026':t;
-        }
+        if(n.nodeType===3){var t=n.textContent;return t.length>5000?t.slice(0,5000)+'\\u2026':t;}
         if(n.nodeType!==1)return null;
         if(n.tagName==='SCRIPT')return null;
         if(n.tagName==='NOSCRIPT')return null;
-        if(n.tagName==='STYLE'){
-          var css=n.sheet?sheetText(n.sheet):null;
-          if(css===null)css=n.textContent||'';
-          return ['STYLE',{},css];
-        }
-        if(n.tagName==='LINK'){
-          var rel=(n.getAttribute&&n.getAttribute('rel')||'').toLowerCase().trim();
-          if(rel==='stylesheet'){
-            var href=n.href||n.getAttribute('href')||'';
-            // First try same-origin access
-            if(n.sheet){
-              var css=sheetText(n.sheet);
-              if(css!==null)return ['STYLE',{'data-href':href},css];
-            }
-            // Then try fetched content
-            if(href && fetchedMap[href]){
-              return ['STYLE',{'data-href':href},fetchedMap[href]];
-            }
-            // Last resort: keep as LINK (won't render in trace viewer but preserves structure)
-            if(href)return ['LINK',{'rel':'stylesheet','href':href},null];
-          }
-        }
         var a={},i,ch=[];
-        for(i=0;i<n.attributes.length;i++){
-          a[n.attributes[i].name]=n.attributes[i].value;
-        }
-        for(i=0;i<n.childNodes.length;i++){
-          var c=s(n.childNodes[i],d+1);
-          if(c!==null)ch.push(c);
-        }
+        for(i=0;i<n.attributes.length;i++){a[n.attributes[i].name]=n.attributes[i].value;}
+        for(i=0;i<n.childNodes.length;i++){var c=s(n.childNodes[i],d+1);if(c!==null)ch.push(c);}
         var base=[n.tagName,a];
         return ch.length?base.concat(ch):base;
       }
       var dt=document.doctype;
       var tree=s(document.documentElement,0);
       if(!Array.isArray(tree))return null;
-      var adopted=document.adoptedStyleSheets||[];
-      for(var ai=0;ai<adopted.length;ai++){
-        var css=sheetText(adopted[ai]);
-        if(css)tree.push(['template',{'__playwright_style_sheet_':css}]);
+      
+      // Capture inline <style> elements for resourceOverrides
+      var styleEls = document.querySelectorAll('style[data-href]');
+      for(var si=0;si<styleEls.length;si++){
+        var el = styleEls[si];
+        var href = el.getAttribute('data-href');
+        var text = el.textContent;
+        if(href && text){
+          // Store as resource override for trace viewer to serve at original URL
+          el.setAttribute('data-resource-override', JSON.stringify({url:href, content:text}));
+        }
       }
+      
+      
+      // Remove or update script tags to prevent JS execution in snapshot
+      var scriptTags = document.querySelectorAll('script');
+      for(var si=0;si<scriptTags.length;si++){
+        var script = scriptTags[si];
+        // Remove src attribute to prevent JS loading
+        if(script.src){
+          script.setAttribute('data-src', script.src);
+          script.removeAttribute('src');
+        }
+      }
+      
+      // Deactivate JS links (modulepreload, preload with as="script", etc.)
+      var jsLinks = document.querySelectorAll('link[rel*="modulepreload"], link[rel*="preload"][as="script"]');
+      for(var si=0;si<jsLinks.length;si++){
+        var link = jsLinks[si];
+        if(link.href && !link.href.startsWith('data:')){
+          // Store original href and remove rel to prevent JS loading
+          link.setAttribute('data-js-href', link.href);
+          link.removeAttribute('rel');
+        }
+      }
+
       return JSON.stringify({
         doctype:dt?dt.name:'html',
         html:tree,
@@ -507,7 +530,7 @@ async function captureDomSnapshot(tabId) {
         scrollY:window.scrollY
       });
     }catch(e){return null;}
-  })(${fetchedJSON})`;
+  })()`;
 
   try {
     const result = await chrome.debugger.sendCommand(
@@ -518,6 +541,10 @@ async function captureDomSnapshot(tabId) {
     if (result && result.result && result.result.value) {
       const parsed = JSON.parse(result.result.value);
       if (parsed && Array.isArray(parsed.html) && typeof parsed.html[0] === 'string') {
+        // Add stylesheet resources for trace generator
+        if (stylesheetResources.length > 0) {
+          parsed.stylesheetResources = stylesheetResources;
+        }
         return parsed;
       }
     }

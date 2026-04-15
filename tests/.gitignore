@@ -1,0 +1,23 @@
+# User data directory (created at runtime)
+user-data/
+
+# Test reports
+playwright-report/
+test-results.json
+
+# Node modules (if installing dependencies locally)
+node_modules/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test results (generated traces)
+test-results/*.zip
+test-results/.last-run.json

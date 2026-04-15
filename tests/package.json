@@ -1,0 +1,20 @@
+{
+  "name": "playwright-trace-recorder-tests",
+  "version": "1.0.0",
+  "description": "E2E tests for Playwright Trace Recorder Chrome extension",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test",
+    "test:reporting": "playwright test --reporter=html,json,junit",
+    "test:trace": "playwright test --trace on-first-retry"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.45.0"
+  },
+  "keywords": [
+    "playwright",
+    "tests",
+    "chrome-extension"
+  ],
+  "license": "Apache-2.0"
+}

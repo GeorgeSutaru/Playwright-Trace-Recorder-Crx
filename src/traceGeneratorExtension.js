@@ -150,6 +150,26 @@ async function generatePlaywrightTraceInBrowser(tracePayload) {
     }
   }
 
+  // Helper function to get file extension from MIME type (matches Ventriloquist implementation)
+  function getResourceExtensionFromMime(mime) {
+    if (!mime) return '';
+    if (mime.includes('image/jpeg')) return '.jpeg';
+    if (mime.includes('image/png')) return '.png';
+    if (mime.includes('image/webp')) return '.webp';
+    if (mime.includes('image/gif')) return '.gif';
+    if (mime.includes('image/svg+xml')) return '.svg';
+    if (mime.includes('video/mp4')) return '.mp4';
+    if (mime.includes('audio/mpeg')) return '.mp3';
+    if (mime.includes('font/woff2')) return '.woff2';
+    if (mime.includes('font/woff')) return '.woff';
+    if (mime.includes('font/ttf')) return '.ttf';
+    if (mime.includes('css')) return '.css';
+    if (mime.includes('javascript')) return '.js';
+    if (mime.includes('json')) return '.json';
+    if (mime.includes('html')) return '.html';
+    return '';
+  }
+
   // Generate resource-snapshot entries for trace.network
   for (const [, req] of networkRequests.entries()) {
     if (!req.url || !req.url.startsWith('http')) continue;
@@ -159,9 +179,15 @@ async function generatePlaywrightTraceInBrowser(tracePayload) {
       const bodyBuf = req.base64Encoded
         ? base64ToUint8Array(req.body)
         : new TextEncoder().encode(req.body);
-      responseSha1 = await sha1Hex(bodyBuf);
+      const pureSha1 = await sha1Hex(bodyBuf);
+      
+      // Get file extension from MIME type (matches Ventriloquist pattern)
+      const ext = getResourceExtensionFromMime(req.mimeType);
+      responseSha1 = pureSha1 + ext;
+      
       if (!addedResources.has(responseSha1)) {
         addedResources.add(responseSha1);
+        // Add extension to resource filename
         resourcesFolder.file(responseSha1, bodyBuf);
       }
     }
@@ -169,6 +195,9 @@ async function generatePlaywrightTraceInBrowser(tracePayload) {
     traceNetworkLines.push(JSON.stringify({
       type: 'resource-snapshot',
       snapshot: {
+        pageref: pageId,
+        startedDateTime: new Date(req.timestamp || startTime).toISOString(),
+        time: relTime(req.timestamp || startTime),
         request: {
           url: req.url,
           method: req.method,
@@ -184,9 +213,7 @@ async function generatePlaywrightTraceInBrowser(tracePayload) {
             size: req.body ? req.body.length : 0,
             _sha1: responseSha1
           }
-        },
-        startTime: relTime(req.timestamp || startTime),
-        endTime: relTime((req.timestamp || startTime) + 10)
+        }
       },
       pageId: pageId
     }));
@@ -198,7 +225,11 @@ async function generatePlaywrightTraceInBrowser(tracePayload) {
 
   if (tracePayload.resources && Array.isArray(tracePayload.resources)) {
     for (const res of tracePayload.resources) {
+      // Skip JavaScript files - they are not needed in trace resources
       if (res.sha1 && res.data && !addedResources.has(res.sha1)) {
+        // Check if this is a JavaScript resource by looking at the sha1 filename
+        if (res.sha1.includes('.js') || res.sha1.startsWith('script-')) continue;
+        
         let base64Data = res.data;
         if (base64Data.startsWith('data:')) {
           base64Data = base64Data.split(',')[1];
@@ -211,9 +242,13 @@ async function generatePlaywrightTraceInBrowser(tracePayload) {
 
         if (!addedResources.has(trueSha1)) {
           addedResources.add(trueSha1);
-          resourcesFolder.file(trueSha1, bodyBuf);
+          // Extract just the filename to avoid nested directories
+          const fileName = trueSha1.split('/').pop() || trueSha1;
+          console.log('[TraceGen] Storing resource from tracePayload.resources:', res.sha1, '->', fileName);
+          resourcesFolder.file(fileName, bodyBuf);
+        } else {
+          console.log('[TraceGen] Resource already stored (tracePayload.resources):', res.sha1);
         }
-        addedResources.add(res.sha1);
       }
     }
   }
@@ -227,22 +262,103 @@ async function generatePlaywrightTraceInBrowser(tracePayload) {
     if (typeof domSnap.html === 'string') return false;
     if (!Array.isArray(domSnap.html)) return false;
 
+    // Initialize resourceOverrides first (will be populated below)
     const resourceOverrides = [];
+
+    // Build stylesheet resource map for href replacement
+    const stylesheetResourceMap = new Map();
+    
+    // Process resourceOverrides from inline <style> elements
     if (Array.isArray(domSnap.resourceOverrides)) {
       for (const override of domSnap.resourceOverrides) {
         if (override.url && typeof override.content === 'string') {
+          // Store sha1 reference for trace viewer to fetch CSS dynamically
           const buf = new TextEncoder().encode(override.content);
           const sha1 = await sha1Hex(buf);
+          
+          // Store CSS file with true SHA1 hash
+          const cssPath = sha1 + '.css';
           if (!addedResources.has(sha1)) {
             addedResources.add(sha1);
-            resourcesFolder.file(sha1, buf);
+            resourcesFolder.file(cssPath, buf);
           }
-          resourceOverrides.push({ url: override.url, sha1 });
+          
+          resourceOverrides.push({ url: override.url, sha1: sha1 + ".css" });
+          stylesheetResourceMap.set(override.url, 'resources/' + cssPath);
         } else if (override.url && typeof override.content === 'number') {
           resourceOverrides.push({ url: override.url, ref: override.content });
         }
       }
     }
+
+    // Also process stylesheetResources from the extension
+    if (Array.isArray(domSnap.stylesheetResources)) {
+      for (const sheet of domSnap.stylesheetResources) {
+        if (sheet.href && sheet.cssContent) {
+          const buf = new TextEncoder().encode(sheet.cssContent);
+          const sha1 = await sha1Hex(buf);
+          
+          // Store CSS file with true SHA1 hash
+          const cssPath = sha1 + '.css';
+          if (!addedResources.has(sha1)) {
+            addedResources.add(sha1);
+            resourcesFolder.file(cssPath, buf);
+          }
+          
+          resourceOverrides.push({ url: sheet.href, sha1: sha1 + ".css" });
+          stylesheetResourceMap.set(sheet.href, 'resources/' + cssPath);
+        }
+      }
+    }
+
+    // Clone and update HTML tree - only replace JS links to prevent execution
+    function updateHtmlTree(node) {
+      if (!Array.isArray(node) || node.length < 2) return node;
+      
+      const [tag, attrs, ...children] = node;
+      
+      // Only replace JavaScript-related links (modulepreload, script preload, etc.)
+      if (tag === 'LINK' && attrs) {
+        const rel = attrs.rel || '';
+        const as = attrs.as || '';
+        
+        // Replace modulepreload and script preload links to prevent JS execution
+        if (rel.includes('modulepreload') || (rel.includes('preload') && as === 'script')) {
+          const href = attrs.href;
+          if (href) {
+            // Store original href and remove rel to prevent JS loading
+            attrs['data-js-href'] = href;
+            if (rel.includes('modulepreload')) {
+              attrs.rel = rel.replace('modulepreload', '').trim();
+            }
+            if (rel.includes('preload') && as === 'script') {
+              attrs.rel = rel.replace('preload', '').trim();
+            }
+          }
+        }
+      } else if (tag === 'STYLE' && attrs) {
+        // Remove data-href from inline styles - trace viewer will fetch the CSS
+        if (attrs['data-href']) {
+          delete attrs['data-href'];
+        }
+      } else if (tag === 'SCRIPT' && attrs) {
+        // Remove src attribute to prevent JS loading
+        if (attrs.src) {
+          attrs['data-src'] = attrs.src;
+          delete attrs.src;
+        }
+      }
+      
+      // Recursively update children
+      const updatedChildren = children.map(child => {
+        if (Array.isArray(child)) return updateHtmlTree(child);
+        return child;
+      });
+      
+      return [tag, attrs, ...updatedChildren];
+    }
+
+    const updatedHtml = updateHtmlTree(domSnap.html || ['HTML', {}, ['HEAD'], ['BODY']]);
 
     const snapshotObj = {
       callId,
@@ -251,7 +367,7 @@ async function generatePlaywrightTraceInBrowser(tracePayload) {
       frameId: mainFrameId,
       frameUrl: domSnap.url || tracePayload.url || '',
       doctype: domSnap.doctype || 'html',
-      html: domSnap.html || ['HTML', {}, ['HEAD'], ['BODY']],
+      html: updatedHtml,
       viewport: domSnap.viewport || tracePayload.viewport || { width: 1280, height: 720 },
       timestamp: snapTime,
       wallTime: snapTime,

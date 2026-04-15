@@ -29,10 +29,10 @@ function broadcastToPanel(message) {
 
 // Initialize extension
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('Ventriloquist Standalone installed/updated');
+  console.log('Playwright Trace Recorder installed/updated');
 });
 
-console.log('Ventriloquist Standalone Service Worker running');
+console.log('Playwright Trace Recorder Service Worker running');
 
 // Helper function to downscale screenshots to fit within max dimensions (Playwright style)
 function inscribe(object, area) {
@@ -57,16 +57,20 @@ async function startRecording(name, tabId) {
     resources: [],
     lastDomSnapshot: null,
     url: null,
-    viewport: null
+    viewport: null,
+    consecutiveSnapshotFailures: 0, // Track consecutive failures to prevent infinite loops
+    maxConsecutiveFailures: 5 // Stop trying snapshots after this many failures
   };
   console.log(`Recording started: ${name} (tabId=${tabId})`);
 
+  // Attach Chrome Debugger to capture DOM snapshots, screenshots and network
   if (tabId) {
     try {
       await chrome.debugger.attach({ tabId }, '1.3');
       console.log(`Debugger attached to tab ${tabId}`);
     } catch (e) {
       console.warn('Could not attach debugger:', e.message);
+      // Recording continues without CDP enhancements
       activeRecording.debuggeeTabId = null;
     }
     // Enable CDP domains independently — a failed domain should not kill the session
@@ -81,6 +85,7 @@ async function startRecording(name, tabId) {
     }
   }
 
+  // Capture the initial DOM state before any interactions
   if (activeRecording.debuggeeTabId) {
     const initialSnapshot = await captureDomSnapshot(activeRecording.debuggeeTabId);
     if (initialSnapshot) {
@@ -88,11 +93,19 @@ async function startRecording(name, tabId) {
       activeRecording.url = initialSnapshot.url || null;
       activeRecording.viewport = initialSnapshot.viewport || null;
     }
+
+    // Capture resources already loaded before recording started (CSS, HTML, fonts)
+    // This mirrors Playwright's HarTracer which hooks network events before page.goto()
+    activeRecording.capturePreloadedPromise =
+      capturePreloadedResources(activeRecording.debuggeeTabId, activeRecording).catch(e =>
+        console.warn('capturePreloadedResources failed:', e.message)
+      );
   }
 
-  if (tabId) {
+  // Notify content script on the inspected tab to start capturing
+  if (activeRecording.debuggeeTabId) {
     try {
-      await chrome.tabs.sendMessage(tabId, { type: 'RECORDING_STARTED' });
+      await chrome.tabs.sendMessage(activeRecording.debuggeeTabId, { type: 'RECORDING_STARTED' });
     } catch (_) {
       // Content script unresponsive — stale context after extension reload.
       // Reset the injection guard so the re-injected script takes the full init
@@ -100,17 +113,58 @@ async function startRecording(name, tabId) {
       // recording:true → starts capturing interactions).
       try {
         await chrome.scripting.executeScript({
-          target: { tabId },
+          target: { tabId: activeRecording.debuggeeTabId },
           func: () => { window._ventriloquistInjected = false; }
         });
         await chrome.scripting.executeScript({
-          target: { tabId },
+          target: { tabId: activeRecording.debuggeeTabId },
           files: ['src/content.js']
         });
       } catch (e) {
         console.warn('Could not re-inject content script:', e.message);
       }
     }
+
+    // Set up navigation listener to re-enable CDP domains after page changes
+    // This is a separate listener that works alongside the main event capture listener
+    chrome.debugger.onEvent.addListener((sender, method, params) => {
+      if (method === 'Page.navigatedWithinDocument') {
+        console.log('Navigated within document, re-enabling Network domain');
+        // Re-enable Network domain for SPA navigations
+        chrome.debugger.sendCommand(
+          { tabId: activeRecording?.debuggeeTabId },
+          'Network.enable'
+        ).then(() => {
+          // Reset failure counter after successful navigation - the page is now clean
+          if (activeRecording) {
+            activeRecording.consecutiveSnapshotFailures = 0;
+            console.log('Reset snapshot failure counter after navigation');
+          }
+        }).catch(e => console.warn('Failed to re-enable Network:', e));
+      } else if (method === 'Page.frameNavigated') {
+        console.log('Frame navigated, re-enabling all domains for frame: %s', params.frame?.id);
+        // Re-enable all CDP domains after major navigation
+        for (const domain of ['Network', 'Page', 'Runtime', 'Log']) {
+          chrome.debugger.sendCommand(
+            { tabId: activeRecording?.debuggeeTabId },
+            `${domain}.enable`
+          ).catch(e => console.warn(`Failed to re-enable ${domain}:`, e));
+        }
+        // Reset failure counter after major navigation
+        if (activeRecording) {
+          activeRecording.consecutiveSnapshotFailures = 0;
+          console.log('Reset snapshot failure counter after frame navigation');
+        }
+      } else if (method === 'Page.loadEventFired') {
+        console.log('Page fully loaded, ready for snapshots');
+        // Page has fully loaded - we can now safely attempt snapshots
+        if (activeRecording) {
+          activeRecording.consecutiveSnapshotFailures = 0;
+        }
+      } else if (method === 'Network.enable') {
+        console.log('Network domain re-enabled successfully');
+      }
+    });
   }
 
   broadcastToPanel({
@@ -157,7 +211,152 @@ async function stopRecording() {
   }
 }
 
-// Function to handle recorded events
+// Function to handle recorded events (enhanced version with screenshots and snapshots)
+async function handleRecordEventEnhanced(event) {
+  if (!activeRecording) return;
+
+  const callId = `call@${Date.now()}@${Math.floor(Math.random() * 1000)}`;
+  const timestamp = Date.now();
+
+  const viewport = activeRecording.viewport || { width: 1280, height: 720 };
+
+  // --- DOM Snapshot: "before" is the last known stable DOM state (set after previous interaction) ---
+  const beforeDomSnapshot = activeRecording.lastDomSnapshot || null;
+
+  // --- DOM Snapshot: "action" + screenshot — captured at the moment we receive the interaction ---
+  let actionDomSnapshot = null;
+  let actionScreenshot = null;
+  if (activeRecording.debuggeeTabId && activeRecording.consecutiveSnapshotFailures < activeRecording.maxConsecutiveFailures) {
+    try {
+      actionDomSnapshot = await captureDomSnapshot(activeRecording.debuggeeTabId);
+    } catch (e) {
+      console.warn(`Failed to capture action DOM snapshot: ${e.message}`);
+      if (activeRecording.consecutiveSnapshotFailures < activeRecording.maxConsecutiveFailures - 1) {
+        activeRecording.consecutiveSnapshotFailures++;
+      }
+    }
+  }
+  actionScreenshot = await capturePageScreenshot(activeRecording.debuggeeTabId, viewport);
+
+  if (actionScreenshot) {
+    activeRecording.resources.push({
+      sha1: 'action-' + callId + '.jpeg',
+      data: actionScreenshot.data
+    });
+  }
+
+  activeRecording.events.push({
+    type: 'before',
+    callId,
+    attachments: actionScreenshot ? [{
+      sha1: 'action-' + callId + '.jpeg',
+      width: actionScreenshot.width,
+      height: actionScreenshot.height,
+      name: 'screenshot-before',
+      contentType: 'image/jpeg'
+    }] : [],
+    startTime: timestamp,
+    method: event.type,
+    class: 'Frame',
+    stepId: `pw:api@${Math.floor(Math.random() * 1000)}`,
+    params: { selector: event.selector || '', value: event.value || '' },
+    pageId: 'page1',
+    timestamp: timestamp,
+    domSnapshots: {
+      before: beforeDomSnapshot,
+      action: actionDomSnapshot
+    },
+    // Per-action screenshots: before (re-use action screenshot) + action moment
+    screenshots: {
+      before: actionScreenshot,
+      action: actionScreenshot
+    }
+  });
+
+  // --- DOM Snapshot: "after" — wait for DOM mutations triggered by the interaction to settle ---
+  let afterDomSnapshot = null;
+  let afterScreenshot = null;
+  if (activeRecording.debuggeeTabId && activeRecording.consecutiveSnapshotFailures < activeRecording.maxConsecutiveFailures) {
+    try {
+      await new Promise(resolve => setTimeout(resolve, 150));
+      afterDomSnapshot = await captureDomSnapshot(activeRecording.debuggeeTabId);
+      if (afterDomSnapshot) {
+        activeRecording.lastDomSnapshot = afterDomSnapshot;
+        activeRecording.consecutiveSnapshotFailures = 0;
+      }
+    } catch (e) {
+      console.warn(`Failed to capture after DOM snapshot: ${e.message}`);
+      if (activeRecording.consecutiveSnapshotFailures < activeRecording.maxConsecutiveFailures - 1) {
+        activeRecording.consecutiveSnapshotFailures++;
+      }
+    }
+  }
+  afterScreenshot = await capturePageScreenshot(activeRecording.debuggeeTabId, viewport);
+
+  if (afterScreenshot) {
+    activeRecording.resources.push({
+      sha1: 'after-' + callId + '.jpeg',
+      data: afterScreenshot.data
+    });
+  }
+
+  activeRecording.events.push({
+    type: 'after',
+    callId,
+    endTime: timestamp + 20,
+    timestamp: timestamp + 20,
+    attachments: afterScreenshot ? [{
+      sha1: 'after-' + callId + '.jpeg',
+      width: afterScreenshot.width,
+      height: afterScreenshot.height,
+      name: 'screenshot-after',
+      contentType: 'image/jpeg'
+    }] : [],
+    domAfterSnapshot: afterDomSnapshot,
+    afterScreenshot
+  });
+
+  if (!activeRecording.url && event.url) {
+    activeRecording.url = event.url;
+  }
+}
+
+// Capture a viewport-sized JPEG screenshot via CDP.
+async function capturePageScreenshot(tabId, viewport) {
+  const vp = viewport || { width: 1280, height: 720 };
+  try {
+    const result = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
+      format: 'jpeg',
+      quality: 80,
+      clip: { x: 0, y: 0, width: vp.width, height: vp.height, scale: 1 }
+    });
+    return (result && result.data) ? { data: result.data, width: vp.width, height: vp.height } : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Capture preloaded resources (CSS, HTML, fonts) before recording started
+async function capturePreloadedResources(tabId, recording) {
+  try {
+    const result = await chrome.debugger.sendCommand(
+      { tabId },
+      'Network.getResponseBody',
+      { requestId: '__preloaded_resources__' }
+    );
+    if (result && result.body) {
+      recording.resources.push({
+        sha1: 'preloaded',
+        data: result.body,
+        base64Encoded: result.base64Encoded || false
+      });
+    }
+  } catch (e) {
+    // Ignore - preloaded resources are optional
+  }
+}
+
+// Function to handle recorded events (basic version for backward compatibility)
 function handleRecordEvent(event) {
   if (!activeRecording) {
     console.warn('Received event while not recording');
