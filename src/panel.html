@@ -77,6 +77,19 @@
       margin-bottom: 20px;
     }
 
+    .version-badge {
+      font-size: 11px;
+      font-weight: 600;
+      background: #e5e7eb;
+      color: #374151;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+    [data-theme="dark"] .version-badge {
+      background: #374151;
+      color: #e5e7eb;
+    }
+
     /* ── Theme switcher ─────────────────────────────────── */
     .theme-switcher {
       margin-left: auto;
@@ -355,6 +368,7 @@
     <div class="header">
       <div class="logo">🎭</div>
       <h1>Playwright Trace Recorder</h1>
+      <span class="version-badge" id="versionBadge">v0.1.2</span>
       <div class="theme-switcher">
         <button class="theme-btn" id="themeToggleBtn" title="Toggle theme">☀️</button>
       </div>

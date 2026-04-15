@@ -255,6 +255,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }).catch(() => sendResponse({ tabId: null }));
       return true;
 
+    case 'GET_MANIFEST_VERSION':
+      sendResponse({ version: chrome.runtime.getManifest().version });
+      return true;
+
     case 'open_side_panel': {
       // Content script relays here; Chrome populates sender.tab automatically.
       const tabId = sender.tab?.id;

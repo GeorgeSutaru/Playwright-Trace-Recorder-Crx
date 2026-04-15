@@ -330,6 +330,19 @@ async function deleteTrace(id, li) {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', async () => {
+  // Load version from manifest
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'GET_MANIFEST_VERSION' });
+    if (response && response.version) {
+      const versionBadge = document.getElementById('versionBadge');
+      if (versionBadge) {
+        versionBadge.textContent = `v${response.version}`;
+      }
+    }
+  } catch (err) {
+    console.warn('Could not load version from manifest:', err);
+  }
+
   connectToServiceWorker();
 
   // Initialize toggle button state based on current log content
